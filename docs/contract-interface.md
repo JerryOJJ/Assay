@@ -164,8 +164,8 @@ the same enforcement the SDK applies in the tests:
 | ledger entries written | 200 | 51 | 26% |
 | transaction footprint entries | 400 | 105 | 26% |
 | bytes written | 132 096 | 14 072 | 11% |
-| instructions | 400 000 000 | 3 275 513 | 0.8% |
-| memory | 41 943 040 | 514 609 | 1.2% |
+| instructions | 400 000 000 | 3 383 545 | 0.8% |
+| memory | 41 943 040 | 544 276 | 1.3% |
 
 Each element publishes its own `Attested` event and one such event is exactly
 200 bytes, so the event budget admits **at most 81 elements** however frugal the
@@ -186,6 +186,41 @@ full batch with the SDK's mainnet resource enforcement switched on (which
 `Env::default` enables), asserts it fits every limit, and pins the 200-byte
 per-event cost so the cap is re-derived rather than silently wrong if the event
 or the write path changes.
+
+#### Per-entrypoint cost baseline
+
+The network limits above are only useful if the common calls stay comfortably
+inside them. [`cost-baseline.json`](../assay-contracts/contracts/safety-registry/cost-baseline.json)
+records the measured cost of each consumer-facing entrypoint, and
+`entrypoint_costs_are_within_the_recorded_baseline` re-measures them and fails
+when CPU instructions, memory, read bytes or write bytes grow by more than 10%
+over the committed value.
+
+| Entrypoint | CPU instructions | Memory (bytes) | Read bytes | Write bytes |
+| --- | --- | --- | --- | --- |
+| `attest` | 58 301 | 8 974 | 0 | 352 |
+| `attest_many(50)` | 3 383 545 | 544 276 | 0 | 14 072 |
+| `get_safety` | 25 417 | 3 524 | 0 | 0 |
+| `is_safe` | 21 409 | 3 148 | 0 | 0 |
+| `is_safe_masked` | 21 855 | 3 148 | 0 | 0 |
+
+The numbers come from the SDK's `env.cost_estimate().resources()` after the
+call in isolation, in the same units the network limits use. Read bytes are
+`disk_read_bytes`; live Soroban entries are served from memory in the test
+host, so that number is zero there even though an entry read still costs
+instructions and a memory-entry read. `is_safe` and `is_safe_masked` write
+nothing, so a gate's cost is paid entirely by the consuming transaction.
+
+Run the check with:
+
+```sh
+cargo test --locked -p assay-safety-registry cost
+```
+
+A change that intentionally moves cost beyond the tolerance updates the
+baseline with `UPDATE_COST_BASELINE=1 cargo test -p assay-safety-registry cost`
+and includes the reason in the same commit. Raising the baseline without a
+reason is exactly the silent regression the check exists to prevent.
 
 #### Empty batches, and one timestamp per batch
 

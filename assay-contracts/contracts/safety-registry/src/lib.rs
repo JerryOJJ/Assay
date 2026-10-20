@@ -364,8 +364,8 @@ fn write_attestation(
 /// | ledger entries written | 200 | 51 (26%) |
 /// | transaction footprint entries | 400 | 105 (26%) |
 /// | bytes written | 132 096 | 14 072 (11%) |
-/// | instructions | 400 000 000 | 3 275 513 (0.8%) |
-/// | memory | 41 943 040 | 514 609 (1.2%) |
+/// | instructions | 400 000 000 | 3 383 545 (0.8%) |
+/// | memory | 41 943 040 | 544 276 (1.3%) |
 ///
 /// # What actually binds
 ///

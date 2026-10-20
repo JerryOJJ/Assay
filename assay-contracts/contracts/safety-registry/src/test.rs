@@ -1,16 +1,32 @@
 #![cfg(test)]
 
+extern crate std;
+
 pub mod fail_closed;
 
 use super::*;
 use soroban_sdk::{
     symbol_short,
-    testutils::{Address as _, Events as _, Ledger as _, MockAuth, MockAuthInvoke},
+    testutils::{Address as _, EnvTestConfig, Events as _, Ledger as _, MockAuth, MockAuthInvoke},
     vec, BytesN, Env, IntoVal, Map, Symbol, Vec,
 };
 
 fn setup() -> (Env, SafetyRegistryClient<'static>, Address) {
     let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(SafetyRegistry, ());
+    let client = SafetyRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.init(&admin);
+
+    (env, client, admin)
+}
+
+fn cost_setup() -> (Env, SafetyRegistryClient<'static>, Address) {
+    let env = Env::new_with_config(EnvTestConfig {
+        capture_snapshot_at_drop: false,
+    });
     env.mock_all_auths();
 
     let contract_id = env.register(SafetyRegistry, ());
@@ -1206,8 +1222,8 @@ fn attest_many_rejects_unauthorized_caller() {
 /// | ledger entries written | 200 | 51 |
 /// | transaction footprint entries | 400 | 105 |
 /// | bytes written | 132 096 | 14 072 |
-/// | instructions | 400 000 000 | 3 275 513 |
-/// | memory | 41 943 040 | 514 609 |
+/// | instructions | 400 000 000 | 3 383 545 |
+/// | memory | 41 943 040 | 544 276 |
 #[test]
 fn batch_size_bound_is_measured_and_holds_headroom() {
     let (env, client, _) = setup();
@@ -1687,4 +1703,132 @@ fn get_safety_many_cost_at_the_bound() {
         "instructions exceed 400 000 000"
     );
     assert!(r.mem_bytes <= 41_943_040, "memory exceeds 41 943 040");
+}
+
+const COST_BASELINE: &str = include_str!("../cost-baseline.json");
+const COST_TOLERANCE_PERCENT: i64 = 10;
+
+#[derive(Clone, Copy, Debug)]
+struct Cost {
+    instructions: i64,
+    mem_bytes: i64,
+    disk_read_bytes: i64,
+    write_bytes: i64,
+}
+
+fn invocation_cost(env: &Env) -> Cost {
+    let r = env.cost_estimate().resources();
+    Cost {
+        instructions: r.instructions,
+        mem_bytes: r.mem_bytes,
+        disk_read_bytes: i64::from(r.disk_read_bytes),
+        write_bytes: i64::from(r.write_bytes),
+    }
+}
+
+fn cost_scenarios() -> std::vec::Vec<(&'static str, Cost)> {
+    let mut costs = std::vec::Vec::new();
+
+    let (env, client, _) = cost_setup();
+    env.ledger().set_timestamp(1_234);
+    let asset = Address::generate(&env);
+    client.attest(&asset, &SEVERITY_MEDIUM, &MECH_AUTH_REVOCABLE, &hash(&env));
+    costs.push(("attest", invocation_cost(&env)));
+
+    let (env, client, _) = cost_setup();
+    env.ledger().set_timestamp(1_234);
+    let mut batch = Vec::new(&env);
+    for _ in 0..MAX_BATCH_SIZE {
+        batch.push_back(att(
+            &env,
+            &Address::generate(&env),
+            SEVERITY_MEDIUM,
+            MECH_AUTH_REVOCABLE,
+        ));
+    }
+    client.attest_many(&batch);
+    costs.push(("attest_many_50", invocation_cost(&env)));
+
+    let (env, client, _) = cost_setup();
+    env.ledger().set_timestamp(1_234);
+    let asset = Address::generate(&env);
+    client.attest(&asset, &SEVERITY_MEDIUM, &MECH_AUTH_REVOCABLE, &hash(&env));
+    let _ = client.get_safety(&asset);
+    costs.push(("get_safety", invocation_cost(&env)));
+
+    let (env, client, _) = cost_setup();
+    env.ledger().set_timestamp(1_234);
+    let asset = Address::generate(&env);
+    client.attest(&asset, &SEVERITY_MEDIUM, &MECH_AUTH_REVOCABLE, &hash(&env));
+    let _ = client.is_safe(&asset, &SEVERITY_MEDIUM, &0);
+    costs.push(("is_safe", invocation_cost(&env)));
+
+    let (env, client, _) = cost_setup();
+    env.ledger().set_timestamp(1_234);
+    let asset = Address::generate(&env);
+    client.attest(&asset, &SEVERITY_MEDIUM, &MECH_AUTH_REVOCABLE, &hash(&env));
+    let _ = client.is_safe_masked(&asset, &POLICY_MASK_FREEZE_INCLUSIVE, &0);
+    costs.push(("is_safe_masked", invocation_cost(&env)));
+
+    costs
+}
+
+#[test]
+fn entrypoint_costs_are_within_the_recorded_baseline() {
+    let measured = cost_scenarios();
+
+    if std::env::var("UPDATE_COST_BASELINE").as_deref() == Ok("1") {
+        let mut entrypoints = serde_json::Map::new();
+        for (name, cost) in &measured {
+            entrypoints.insert(
+                std::string::String::from(*name),
+                serde_json::json!({
+                    "instructions": cost.instructions,
+                    "mem_bytes": cost.mem_bytes,
+                    "disk_read_bytes": cost.disk_read_bytes,
+                    "write_bytes": cost.write_bytes,
+                }),
+            );
+        }
+        let document = serde_json::json!({
+            "tolerance_percent": COST_TOLERANCE_PERCENT,
+            "entrypoints": entrypoints,
+        });
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("cost-baseline.json");
+        std::fs::write(
+            path,
+            serde_json::to_string_pretty(&document).expect("serialize cost baseline") + "\n",
+        )
+        .expect("write cost baseline");
+        return;
+    }
+
+    let baseline: serde_json::Value =
+        serde_json::from_str(COST_BASELINE).expect("parse cost-baseline.json");
+    let tolerance = baseline["tolerance_percent"]
+        .as_i64()
+        .unwrap_or(COST_TOLERANCE_PERCENT);
+
+    for (name, cost) in &measured {
+        let entry = &baseline["entrypoints"][name];
+        for (metric, actual) in [
+            ("instructions", cost.instructions),
+            ("mem_bytes", cost.mem_bytes),
+            ("disk_read_bytes", cost.disk_read_bytes),
+            ("write_bytes", cost.write_bytes),
+        ] {
+            let recorded = entry[metric]
+                .as_i64()
+                .unwrap_or_else(|| panic!("cost-baseline.json has no {metric} for {name}"));
+            let limit = if recorded == 0 {
+                0
+            } else {
+                recorded + recorded * tolerance / 100
+            };
+            assert!(
+                actual <= limit,
+                "{name} {metric} regressed: baseline {recorded}, current {actual}, limit {limit} ({tolerance}% tolerance)"
+            );
+        }
+    }
 }

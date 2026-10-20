@@ -126,6 +126,29 @@ golden tests on the pin (`1.26.x`) and one newer release (`1.27.x`), because
 the preimage must be byte-identical across toolchains; a version below the
 floor could not build the module and is deliberately not in the matrix.
 
+### Dependency policy
+
+No new Go or Rust dependency is added without a maintainer decision, as the
+pull request checklist says. Dependency health is checked in CI as well:
+
+- Go modules and the standard library are scanned by `govulncheck` in
+  `.github/workflows/security.yml`.
+- The contracts' `assay-contracts/Cargo.lock` is scanned by `cargo-audit` in the
+  same workflow, on the weekly schedule, on pushes to `main`, and on pull
+  requests that change `Cargo.lock`.
+- `cargo-audit` is pinned at `0.22.2` and installed with `--locked`, so a
+  floating tool upgrade cannot change the result between runs. Advisories fail
+  the job. Unmaintained and yanked-crate warnings are reported but do not fail;
+  the current lockfile has one (`paste`, RUSTSEC-2024-0436), and it is visible
+  in the audit output rather than suppressed with an ignore rule.
+
+Run the contract audit locally with the same input CI uses:
+
+```sh
+cargo install cargo-audit --locked --version 0.22.2
+cargo audit --file assay-contracts/Cargo.lock
+```
+
 ### Contract toolchain
 
 Reproducing a wasm hash recorded in [docs/deployment.md](docs/deployment.md)
@@ -170,6 +193,23 @@ Never hand-write a severity, a bitset, or an evidence hash into a transaction â€
 see [docs/deployment.md](docs/deployment.md).
 
 Run `make fmt` before committing; CI enforces `gofmt -l` being empty.
+
+### Contract wasm size
+
+CI builds both contracts with the pinned `stellar` CLI and compares the
+optimized sizes against
+[`assay-contracts/wasm-size-baseline.json`](assay-contracts/wasm-size-baseline.json).
+The result is printed in the contract job and its summary; growth beyond the
+recorded tolerance fails the job. Run the same check locally with `make
+wasm-size`, or record an intentional change with:
+
+```sh
+./scripts/check-wasm-size.sh --record
+```
+
+Keep a baseline update in the same commit as the change that caused it, with
+the reason in the commit message. The baseline names the CLI version that
+produced it, and the check refuses to compare sizes from a different version.
 
 ### Coverage
 

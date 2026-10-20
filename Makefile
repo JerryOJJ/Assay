@@ -12,7 +12,7 @@ CONTRACT_ID ?= CBK4FBIHMDTXCUPE4E3ZDVSFJSCY5FJETTKNIQPN4LFJIKKIBLKIXQ73
 
 .PHONY: all build build-release test test-notify test-preimage test-reproducibility cover lint fmt vet run clean \
 	offline-test e2e-standalone \
-	contract-test contract-lint contract-build \
+	contract-test contract-lint contract-build wasm-size \
 	build-contract deploy-testnet attest read verify-gate verify-wasm \
 	eval-record eval-compare
 
@@ -105,6 +105,9 @@ contract-lint:
 
 contract-build:
 	cd $(CONTRACTS) && cargo build --release --target wasm32v1-none
+
+wasm-size:
+	./scripts/check-wasm-size.sh
 
 # build-contract produces the deployable artifact. It goes through the stellar
 # CLI rather than cargo because the CLI also runs the wasm optimizer and checks
