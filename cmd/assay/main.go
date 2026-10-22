@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -24,6 +25,14 @@ import (
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
+		var exitErr *commandExitError
+		if errors.As(err, &exitErr) {
+			if exitErr.err == nil {
+				os.Exit(exitErr.code)
+			}
+			fmt.Fprintln(os.Stderr, "assay:", exitErr.err)
+			os.Exit(exitErr.code)
+		}
 		fmt.Fprintln(os.Stderr, "assay:", err)
 		os.Exit(1)
 	}
@@ -35,6 +44,8 @@ func usage() {
   assay attestation CODE-ISSUER   print the on-chain attest() arguments for one asset
   assay history [-guarantee] [-raw] CODE-ISSUER
                                   print the asset's observation history
+  assay verify [-version VERSION] HASH PREIMAGE
+                                  compare a stored hash with canonical preimage bytes
   assay serve [-addr] [-history PATH]
                                   serve the HTTP API and UI
 `)
@@ -55,6 +66,8 @@ func run(args []string) error {
 		return runAttestation(args[1:])
 	case "history":
 		return runHistory(args[1:])
+	case "verify":
+		return runVerify(args[1:])
 	case "serve":
 		return runServe(args[1:], log)
 	default:

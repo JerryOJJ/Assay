@@ -1,8 +1,8 @@
 # The CLI
 
-`assay` is one binary with four subcommands. All of them print human-readable
-JSON by default; every subcommand that produces structured output also has a
-`-raw` form that prints tab-separated values, for scripts and CI.
+`assay` is one binary with five subcommands. Commands that produce structured
+output print human-readable JSON by default; `verify` prints a single outcome
+token, and structured-output commands also offer a `-raw` form where useful.
 
 ```
 usage:
@@ -10,6 +10,8 @@ usage:
   assay attestation CODE-ISSUER   print the on-chain attest() arguments for one asset
   assay history [-guarantee] [-raw] CODE-ISSUER
                                   print the asset's observation history
+  assay verify [-version VERSION] HASH PREIMAGE
+                                  compare a stored hash with canonical preimage bytes
   assay serve [-addr] [-history PATH]
                                   serve the HTTP API and UI
 ```
@@ -71,6 +73,30 @@ Semantics:
   0 unless `-guarantee` was given.
 - **unknown state** — an observation whose claim matches no known transition
   prints with transition `unknown` rather than being dropped.
+
+## assay verify
+
+Compares a stored SHA-256 evidence hash with canonical preimage bytes. `PREIMAGE`
+is a file path, or `-` to read the bytes from standard input. `-version` names
+the encoding version expected by the stored hash; without it, the verifier
+checks the current bytes and then tests the supported v1/v2 representation
+change.
+
+```
+./assay verify HASH preimage.txt
+./assay verify -version assay-evidence-v1 HASH preimage.txt
+./assay attestation -preimage CODE-ISSUER | jq -r .preimage | ./assay verify HASH -
+```
+
+The command prints one token and uses distinct exit codes for verification
+outcomes:
+
+- `MATCH` — exit 0; the preimage hashes to the stored hash.
+- `MISMATCH` — exit 1; neither the supplied encoding nor a supported
+  version-only recomputation matches.
+- `ENCODING_DIFFERS` — exit 2; the same evidence matches after recomputing
+  with the other supported encoding version.
+- Invalid arguments, unsupported versions, or unreadable input — exit 3.
 
 ## assay serve
 

@@ -135,6 +135,24 @@ if you see it, you are comparing against the wrong record or the wrong network.
 
 ### 6. Interpret
 
+For a machine-readable comparison, save or pipe the preimage and use
+`assay verify`:
+
+```sh
+./assay attestation -preimage CODE-ISSUER | jq -r .preimage | ./assay verify HASH -
+./assay verify -version assay-evidence-v1 HASH preimage.txt
+```
+
+`MATCH` (exit 0) means the supplied preimage hashes to the stored hash.
+`MISMATCH` (exit 1) means the evidence bytes do not reproduce it.
+`ENCODING_DIFFERS` (exit 2) means the same preimage evidence matches when
+recomputed under the other supported encoding version, identifying an
+encoding-version difference rather than reporting an unexplained mismatch.
+The optional `-version` is the encoding used when the stored hash was written;
+without it, the verifier tests the supported v1/v2 version difference. Input
+or argument errors exit 3. These outcomes do not establish whether the evidence
+was honest or current; continue with the interpretation below.
+
 **valid — the hashes match.** The stored severity and flags are exactly the ones
 this evidence produces. The attestation corresponds to its stated evidence. This
 says nothing about whether the evidence is *current* — check `attested_at`
