@@ -5,6 +5,10 @@ PKG := ./...
 # description that `make help` reads.
 .DEFAULT_GOAL := help
 
+# How long each target fuzzes under `make fuzz`. `make test` already exercises
+# the committed seed corpus; this default is for manual exploration.
+FUZZTIME ?= 5m
+
 CONTRACTS := assay-contracts
 WASM := $(CONTRACTS)/out/assay_safety_registry.wasm
 
@@ -97,6 +101,12 @@ cover: ## Print the per-package coverage table, lowest first
 	rc=$$?; cat coverage.log; echo; \
 	./scripts/coverage-report.sh coverage.log coverage.out; \
 	exit $$rc
+
+# Runs each fuzz target for FUZZTIME. CI runs a short 30s per target; this
+# target is for longer manual passes: make fuzz FUZZTIME=10m
+fuzz: ## Fuzz ParseAsset and the stellar.toml parser for FUZZTIME each (default 5m)
+	go test ./internal/scan/ -run Fuzz -fuzz FuzzParseAsset -fuzztime $(FUZZTIME)
+	go test ./internal/sep1/ -run Fuzz -fuzz FuzzParseToml -fuzztime $(FUZZTIME)
 
 fmt: ## Format the Go source with gofmt
 	gofmt -w .
