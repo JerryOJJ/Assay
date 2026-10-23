@@ -20,6 +20,7 @@ import (
 //
 // Bodies captured 2026-09-05 from api.stellar.expert.
 const (
+	bodyAsset = `{"asset":"USDC-GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN-1","code":"USDC","issuer":"GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN","supply":"3675875656477148","trustlines":{"total":2431888,"authorized":2431888,"funded":703330},"rating":{"age":10,"activity":10,"trustlines":10,"liquidity":10,"volume7d":10,"interop":4,"average":9}}`
 	// An address the directory holds no entry for. Note the 200: this endpoint
 	// does not 404 for an unknown address.
 	bodyUnlisted = `{}`
@@ -330,4 +331,26 @@ func FuzzBlockedDomainClassification(f *testing.F) {
 			t.Fatal("listed response has no domain")
 		}
 	})
+}
+
+func TestAssetDecodesAndUsesPublicPath(t *testing.T) {
+	const issuer = "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN"
+	var gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(bodyAsset))
+	}))
+	t.Cleanup(srv.Close)
+
+	asset, err := stellarexpert.New(srv.URL).Asset(context.Background(), "USDC", issuer)
+	if err != nil {
+		t.Fatalf("Asset: %v", err)
+	}
+	if got, want := gotPath, "/explorer/public/asset/USDC-"+issuer; got != want {
+		t.Fatalf("request path = %q, want %q", got, want)
+	}
+	if asset.Supply != "3675875656477148" || asset.Trustlines.Funded != 703330 || asset.Rating.Average != 9 {
+		t.Fatalf("asset decoded wrongly: %+v", asset)
+	}
 }
