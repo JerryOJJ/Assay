@@ -19,11 +19,17 @@ SOURCE ?= assay-attester
 CONTRACT_ID ?= CBK4FBIHMDTXCUPE4E3ZDVSFJSCY5FJETTKNIQPN4LFJIKKIBLKIXQ73
 STELLAR_CLI_VERSION := 27.1.0
 
-.PHONY: all build build-release test test-notify test-preimage test-reproducibility test-stellar-cli-version cover lint fmt vet run clean \
+.PHONY: help doctor all build build-release test test-notify test-preimage test-reproducibility test-stellar-cli-version cover lint fmt vet run clean \
 	offline-test e2e-standalone \
 	contract-test contract-lint contract-build \
 	build-contract deploy-testnet attest read check-stellar-cli-version verify-gate verify-wasm \
 	eval-record eval-compare
+
+help: ## List every target with a one-line description
+	@awk 'BEGIN {FS = ":.*## "; print "Usage: make <target>\n\nTargets:"} /^[a-zA-Z0-9_.-]+:.*## / {printf "  %-20s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
+
+doctor: ## Check the local toolchain against the versions this repo pins
+	./scripts/doctor.sh
 
 all: build ## Build the scanner (same as build)
 
