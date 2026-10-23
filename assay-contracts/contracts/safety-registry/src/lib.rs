@@ -81,6 +81,18 @@ pub const POLICY_MASK_CONFISCATION_ONLY: u32 = MECH_CLAWBACK_ENABLED;
 /// issuer uses this mask.
 pub const POLICY_MASK_FREEZE_INCLUSIVE: u32 = MECH_AUTH_REVOCABLE | MECH_CLAWBACK_ENABLED;
 
+/// The contract's interface version, bumped on every ABI change.
+///
+/// Consumers and drift tooling can ask "what is this contract?" by calling
+/// [`Self::version`] instead of inferring the interface from a wasm hash.
+///
+/// Bump this whenever the entrypoint set, the [`Safety`] or [`Attestation`]
+/// shapes, the error codes, or the event schema change. Additive read-only
+/// entrypoints do not require a bump; removing or renaming one does. Version 1
+/// established the interface with [`Self::version`]; version 2 adds
+/// [`Self::cancel_admin_transfer`] and the [`AdminTransferCancelled`] event.
+pub const INTERFACE_VERSION: u32 = 2;
+
 /// Event emitted on every successful `attest` write. Rejected attestations
 /// (`InvalidSeverity`, `InconsistentAttestation`, unauthorized caller) publish
 /// nothing, so observers never see writes that did not happen.
@@ -125,6 +137,45 @@ pub struct Revoked {
     pub asset: Address,
     /// Ledger timestamp of the revocation.
     pub revoked_at: u64,
+}
+
+/// The largest number of attestors [`SafetyRegistry::quorum`] and
+/// [`SafetyRegistry::is_safe_quorum`] accept in one call.
+///
+/// Bounding the attestor vector ensures predictable read costs and execution
+/// footprint against network transaction invocation limits.
+pub const MAX_ATTESTORS: u32 = 16;
+
+/// Quorum status returned by [`SafetyRegistry::quorum`].
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Quorum {
+    /// Quorum met: at least `threshold` responding attestors within `max_age_secs`
+    /// agree on the attestation (or are aggregated conservatively), returning
+    /// the conservative `Safety`.
+    Met(Safety),
+    /// Unavailable: strictly fewer responding attestors within `max_age_secs` than `threshold`.
+    /// The payload is the count of responding attestors.
+    Unavailable(u32),
+    /// Contested: at least `threshold` attestors responded within `max_age_secs`, but they
+    /// disagree on severity or flags. The payload is the count of responding attestors.
+    Contested(u32),
+}
+
+/// Event emitted when the current admin withdraws a pending admin transfer.
+///
+/// Topics: `("cancel_admin", pending_admin)`. A cancellation is the only
+/// admin-transfer step that publishes an event, so an indexer can see that a
+/// proposed handover was withdrawn instead of inferring it from the next
+/// successful `transfer_admin` or `accept_admin`.
+#[contractevent(topics = ["cancel_admin"])]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminTransferCancelled {
+    /// The pending admin whose proposal was withdrawn.
+    #[topic]
+    pub pending_admin: Address,
+    /// Ledger timestamp of the cancellation.
+    pub cancelled_at: u64,
 }
 
 /// One element of a [`SafetyRegistry::attest_many`] batch: the arguments of
@@ -210,14 +261,54 @@ pub struct AttestationEvent {
     pub current: Safety,
 }
 
+/// Event emitted when the current admin proposes a two-step transfer of the
+/// admin role to `new_admin` via [`Self::transfer_admin`].
+///
+/// Topics: `("admin_transfer_proposed", old_admin)`. The proposal is not a
+/// transfer until the pending admin calls [`Self::accept_admin`]; this event
+/// records the proposal so an indexer can see a pending handover before it
+/// completes or is withdrawn. The admin role is unchanged by this event.
+#[contractevent(topics = ["admin_transfer_proposed"])]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminTransferProposed {
+    /// The current admin who proposed the transfer.
+    #[topic]
+    pub old_admin: Address,
+    /// The proposed successor.
+    pub new_admin: Address,
+    /// Ledger timestamp of the proposal.
+    pub at: u64,
+}
+
+/// Event emitted when the pending admin completes a two-step transfer via
+/// [`Self::accept_admin`], becoming the new admin.
+///
+/// Topics: `("admin_transferred", old_admin)`. Together with
+/// [`AdminTransferProposed`] and [`AdminTransferCancelled`], this makes every
+/// admin-role change observable in the event stream. The stored attestations
+/// are untouched; only the admin role moves.
+#[contractevent(topics = ["admin_transferred"])]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminTransferred {
+    /// The admin who is being replaced.
+    #[topic]
+    pub old_admin: Address,
+    /// The new admin.
+    pub new_admin: Address,
+    /// Ledger timestamp of the transfer.
+    pub at: u64,
+}
+
 #[contracttype]
 enum DataKey {
     /// Contract admin, the only address permitted to attest.
     Admin,
     /// Proposed new admin during two-step admin transfer.
     PendingAdmin,
-    /// Attestation for one asset, keyed by its Stellar Asset Contract address.
+    /// Attestation for one asset, keyed by its Stellar Asset Contract address (single-attestor / legacy).
     Safety(Address),
+    /// Multi-attestor attestation keyed by (attestor, asset).
+    Attestation(Address, Address),
 }
 
 #[contracterror]
@@ -246,6 +337,17 @@ pub enum Error {
     /// success for assets that were never written, and the off-chain pipeline
     /// would move on believing they had been re-attested.
     BatchTooLarge = 7,
+    /// The `asset` argument is known not to name a Stellar Asset Contract: it
+    /// is this registry's own address, the admin's address, or an address
+    /// whose type is not a contract at all (an account, a muxed account, a
+    /// claimable balance or a liquidity pool id).
+    ///
+    /// Rejected so a fat-fingered write cannot key `Safety(...)` under an
+    /// address nobody meant, pay rent on it and publish an `Attested` event
+    /// naming it. Which contract is at a given address is deliberately NOT
+    /// checked here — see [`validate_asset_address`] for the decision and for
+    /// what the caller owns instead (#349).
+    InvalidAsset = 8,
 }
 
 /// Extends the contract instance's TTL to the network maximum. Extending the
@@ -276,7 +378,14 @@ fn extend_attestation(env: &Env, key: &DataKey) {
 /// not be able to accept anything the single path refuses, and the only way to
 /// be sure of that is for both to call the same code. A reviewer can see the
 /// invariant is not bypassable by reading this function's two call sites.
-fn validate_attestation(severity: u32, flags: u32) -> Result<(), Error> {
+fn validate_attestation(
+    env: &Env,
+    asset: &Address,
+    admin: &Address,
+    severity: u32,
+    flags: u32,
+) -> Result<(), Error> {
+    validate_asset_address(env, asset, admin)?;
     if severity > SEVERITY_CRITICAL {
         return Err(Error::InvalidSeverity);
     }
@@ -284,6 +393,60 @@ fn validate_attestation(severity: u32, flags: u32) -> Result<(), Error> {
         return Err(Error::InconsistentAttestation);
     }
     Ok(())
+}
+
+/// Rejects an `asset` address that is known not to name a Stellar Asset
+/// Contract, before anything is keyed under it (#349).
+///
+/// # What is checked, and why each check is worth its cost
+///
+/// Storage is keyed by any `Address`, so a write aimed at the wrong address is
+/// fail-closed for the real asset — `get_safety` on the real SAC still returns
+/// `None` and every gate still refuses — but it is not harmless: it pays rent
+/// on an entry nobody will ever read as this asset, publishes an `Attested`
+/// event naming an address that is not this asset, and leaves an indexer
+/// something to explain. Three rules answer that. The first two are plain
+/// comparisons; the third reads the address's strkey, one host call and one
+/// small allocation, with no ledger access:
+///
+/// * **Not the registry's own address.** `attest` on the registry would key
+///   `DataKey::Safety(registry)` inside the registry's own storage, and the
+///   resulting event would read as the registry attesting itself.
+/// * **Not the admin's address.** The admin is the writer, never the subject.
+///   It is normally an account, so the rule below already covers it, but the
+///   admin is an arbitrary `Address` — `init` accepts any — and the comparison
+///   stays correct when it is a contract (a multisig, say).
+/// * **Not a non-contract address.** A Stellar Asset Contract is a contract,
+///   so an account (`G…`), a muxed account (`M…`), a claimable balance or a
+///   liquidity pool id can all be ruled out by the address's strkey version
+///   byte (SEP-23): a contract address is `C…`, and nothing else is. This is
+///   the fat-finger case the check exists for: pasting an issuer account
+///   where a SAC address belongs.
+///
+/// # What is deliberately not checked: caller responsibility
+///
+/// Whether the contract at `asset` really is the SAC for the CODE-ISSUER the
+/// scanner scanned. Answering that on-chain would mean invoking the candidate
+/// contract and trusting whatever it says about itself, which is neither cheap
+/// nor self-authenticating: an impostor contract answers for itself. The same
+/// conclusion is reached off-chain instead, by resolving CODE-ISSUER to its SAC
+/// with `stellar contract id asset` — which is what `make attest` does before
+/// it ever signs anything. So an impostor *contract* address passes this check
+/// and the attester owns having resolved the right one; the stored claim is
+/// still what the scanner concluded for the asset it scanned, bound by
+/// `evidence_hash`.
+fn validate_asset_address(env: &Env, asset: &Address, admin: &Address) -> Result<(), Error> {
+    if *asset == env.current_contract_address() || *asset == *admin {
+        return Err(Error::InvalidAsset);
+    }
+    // The off-host `ScAddress::from` conversion is compiled out of wasm builds,
+    // so the type is read from the strkey instead: `C…` is a contract, and
+    // every other version byte — account `G…`, muxed `M…`, and the tags for
+    // claimable balances and liquidity pools — cannot name a SAC.
+    match asset.to_string().to_bytes().get(0) {
+        Some(b'C') => Ok(()),
+        _ => Err(Error::InvalidAsset),
+    }
 }
 
 /// Writes one attestation and publishes its event. Shared by both write paths
@@ -393,6 +556,14 @@ impl SafetyRegistry {
         env.storage()
             .instance()
             .set(&DataKey::PendingAdmin, &new_admin);
+
+        AdminTransferProposed {
+            old_admin: admin.clone(),
+            new_admin: new_admin.clone(),
+            at: env.ledger().timestamp(),
+        }
+        .publish(&env);
+        extend_instance(&env);
         Ok(())
     }
 
@@ -409,9 +580,79 @@ impl SafetyRegistry {
             .ok_or(Error::NoPendingAdmin)?;
         pending.require_auth();
 
+        let old_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+
         env.storage().instance().set(&DataKey::Admin, &pending);
         env.storage().instance().remove(&DataKey::PendingAdmin);
+
+        AdminTransferred {
+            old_admin: old_admin.clone(),
+            new_admin: pending.clone(),
+            at: env.ledger().timestamp(),
+        }
+        .publish(&env);
+        extend_instance(&env);
         Ok(())
+    }
+
+    /// Withdraws a pending admin transfer proposed by [`Self::transfer_admin`].
+    ///
+    /// Requires authorization from the current admin. The admin role is
+    /// unchanged; only the pending proposal is cleared, so the current admin
+    /// keeps attesting and the previously pending address can no longer call
+    /// [`Self::accept_admin`].
+    ///
+    /// Cancelling when no transfer is pending returns [`Error::NoPendingAdmin`]
+    /// rather than succeeding quietly, so an operator learns the proposal was
+    /// already absent. Emits an [`AdminTransferCancelled`] event on success.
+    pub fn cancel_admin_transfer(env: Env) -> Result<(), Error> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+
+        // Report a missing proposal before requiring auth, so "nothing to
+        // cancel" is always the typed error rather than an auth failure. This
+        // is safe: the path changes no state.
+        let pending: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingAdmin)
+            .ok_or(Error::NoPendingAdmin)?;
+        admin.require_auth();
+
+        env.storage().instance().remove(&DataKey::PendingAdmin);
+        extend_instance(&env);
+
+        // Published after the removal, for the same reason as in `attest`: an
+        // observer must never see a cancellation that did not happen.
+        AdminTransferCancelled {
+            pending_admin: pending,
+            cancelled_at: env.ledger().timestamp(),
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Reads the current contract admin, if initialized.
+    ///
+    /// Returns `None` before [`Self::init`] has been called, and `Some(Address)`
+    /// afterwards.
+    pub fn admin(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::Admin)
+    }
+
+    /// Reads the pending admin during a two-step admin transfer, if any.
+    ///
+    /// Returns `Some(Address)` between [`Self::transfer_admin`] and [`Self::accept_admin`],
+    /// and `None` when no transfer is pending.
+    pub fn pending_admin(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::PendingAdmin)
     }
 
     /// Writes an attestation for `asset`, identified by its SAC address.
@@ -420,7 +661,11 @@ impl SafetyRegistry {
     /// scanner: `assay attestation CODE-ISSUER` derives all three from a live
     /// scan, and `make attest` submits them. Validation here is not a
     /// formality: it enforces at write time the invariants that
-    /// [`Self::is_safe`] relies on at read time.
+    /// [`Self::is_safe`] relies on at read time. It also refuses an `asset`
+    /// that is known not to name a Stellar Asset Contract — this registry's
+    /// own address, the admin's address, or a non-contract address — with
+    /// [`Error::InvalidAsset`]; see [`validate_asset_address`] for what that
+    /// check can and cannot establish (#349).
     ///
     /// Emits an [`AttestationEvent`] with the previous value (if any) and the
     /// new value, providing an on-chain audit trail. See the event
@@ -439,7 +684,7 @@ impl SafetyRegistry {
             .ok_or(Error::NotInitialized)?;
         admin.require_auth();
 
-        validate_attestation(severity, flags)?;
+        validate_attestation(&env, &asset, &admin, severity, flags)?;
 
         write_attestation(
             &env,
@@ -467,10 +712,10 @@ impl SafetyRegistry {
     ///
     /// A batch is applied whole or not at all. Every element is validated
     /// before the first write, so a batch containing one bad element returns
-    /// [`Error::InvalidSeverity`] or [`Error::InconsistentAttestation`] and
-    /// stores nothing: there is no view in which some assets were re-attested
-    /// and others silently were not. Nothing is truncated or skipped to make a
-    /// partly-bad batch fit.
+    /// [`Error::InvalidAsset`], [`Error::InvalidSeverity`] or
+    /// [`Error::InconsistentAttestation`] and stores nothing: there is no view
+    /// in which some assets were re-attested and others silently were not.
+    /// Nothing is truncated or skipped to make a partly-bad batch fit.
     ///
     /// The host already rolls a transaction back on failure, so a batch could
     /// not half-commit even without this. The two-phase shape buys two things
@@ -529,7 +774,7 @@ impl SafetyRegistry {
         // what makes the batch all-or-nothing at the contract level rather than
         // only by the host's transaction rollback.
         for a in attestations.iter() {
-            validate_attestation(a.severity, a.flags)?;
+            validate_attestation(&env, &a.asset, &admin, a.severity, a.flags)?;
         }
 
         if attestations.is_empty() {
@@ -625,6 +870,41 @@ impl SafetyRegistry {
         env.storage().persistent().get(&DataKey::Safety(asset))
     }
 
+    /// Returns the contract's interface version, bumped on every ABI change.
+    ///
+    /// A consumer or a drift script can call this to learn what the contract
+    /// is rather than inferring it from a wasm hash. See [`INTERFACE_VERSION`]
+    /// for the bump rule.
+    pub fn version(_env: Env) -> u32 {
+        INTERFACE_VERSION
+    }
+
+    /// Reads the attestations for `assets`, returning one `Option<Safety>` per
+    /// asset in the same order the assets were given.
+    ///
+    /// An asset that was never attested, or whose attestation was revoked,
+    /// reads as `None`. A missing asset never fails the whole call: only the
+    /// bound can reject it.
+    ///
+    /// # Bound
+    ///
+    /// At most [`MAX_BATCH_SIZE`] assets are accepted; a longer vector returns
+    /// [`Error::BatchTooLarge`] and reads nothing. The bound mirrors
+    /// [`Self::attest_many`]'s so one number governs both directions of the
+    /// batch, and the read cost at the bound is pinned by
+    /// `get_safety_many_cost_at_the_bound`.
+    pub fn get_safety_many(env: Env, assets: Vec<Address>) -> Result<Vec<Option<Safety>>, Error> {
+        if assets.len() > MAX_BATCH_SIZE {
+            return Err(Error::BatchTooLarge);
+        }
+
+        let mut results = Vec::new(&env);
+        for asset in assets.iter() {
+            results.push_back(Self::get_safety(env.clone(), asset.clone()));
+        }
+        Ok(results)
+    }
+
     /// The fail-closed gate helper.
     ///
     /// Returns `true` only when an attestation exists, is fresh enough, and is
@@ -706,6 +986,174 @@ impl SafetyRegistry {
             if now.saturating_sub(safety.attested_at) > max_age_secs {
                 return false;
             }
+        }
+
+        true
+    }
+
+    /// Reads the attestation written by a specific `attestor` for `asset`.
+    ///
+    /// Checks multi-attestor storage `Attestation(attestor, asset)`. If not present
+    /// and `attestor` is the contract admin, falls back to legacy `Safety(asset)`
+    /// storage to support the migration path.
+    pub fn get_attestation(env: Env, attestor: Address, asset: Address) -> Option<Safety> {
+        let key = DataKey::Attestation(attestor.clone(), asset.clone());
+        if let Some(safety) = env.storage().persistent().get(&key) {
+            return Some(safety);
+        }
+        if let Some(admin) = Self::admin(env.clone()) {
+            if admin == attestor {
+                return Self::get_safety(env, asset);
+            }
+        }
+        None
+    }
+
+    /// Evaluates quorum across a consumer-chosen set of `attestors` for `asset`.
+    ///
+    /// Attestors are deduplicated before evaluation.
+    /// Returns:
+    /// - `Quorum::Unavailable(responding_count)` if responding_count < threshold, or threshold == 0, or threshold > deduplicated_attestors.len(), or deduplicated_attestors.len() > MAX_ATTESTORS
+    /// - `Quorum::Contested(responding_count)` if responding_count >= threshold, but responding attestors differ in severity or flags
+    /// - `Quorum::Met(Safety)` if responding_count >= threshold and responding attestors agree on severity and flags
+    pub fn quorum(
+        env: Env,
+        asset: Address,
+        attestors: Vec<Address>,
+        threshold: u32,
+        max_age_secs: u64,
+    ) -> Quorum {
+        // Deduplicate attestors
+        let mut deduped = Vec::new(&env);
+        for a in attestors.iter() {
+            let mut found = false;
+            for d in deduped.iter() {
+                if a == d {
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                deduped.push_back(a);
+            }
+        }
+
+        let deduped_len = deduped.len();
+        if threshold == 0 || threshold > deduped_len || deduped_len > MAX_ATTESTORS {
+            return Quorum::Unavailable(0);
+        }
+
+        let now = env.ledger().timestamp();
+        let mut responding_count = 0u32;
+        let mut max_severity = 0u32;
+        let mut union_flags = 0u32;
+        let mut min_severity = u32::MAX;
+        let mut first_flags = 0u32;
+        let mut latest_timestamp = 0u64;
+        let mut evidence_hash = BytesN::from_array(&env, &[0u8; 32]);
+        let mut all_agree = true;
+
+        for attestor in deduped.iter() {
+            if let Some(s) = Self::get_attestation(env.clone(), attestor, asset.clone()) {
+                if max_age_secs == 0 || now.saturating_sub(s.attested_at) <= max_age_secs {
+                    if responding_count == 0 {
+                        first_flags = s.flags;
+                        evidence_hash = s.evidence_hash.clone();
+                    } else if s.severity != max_severity || s.flags != first_flags {
+                        all_agree = false;
+                    }
+
+                    responding_count += 1;
+                    if s.severity > max_severity {
+                        max_severity = s.severity;
+                    }
+                    if s.severity < min_severity {
+                        min_severity = s.severity;
+                    }
+                    union_flags |= s.flags;
+                    if s.attested_at > latest_timestamp {
+                        latest_timestamp = s.attested_at;
+                        evidence_hash = s.evidence_hash.clone();
+                    }
+                }
+            }
+        }
+
+        if responding_count < threshold {
+            Quorum::Unavailable(responding_count)
+        } else if !all_agree || max_severity != min_severity {
+            Quorum::Contested(responding_count)
+        } else {
+            Quorum::Met(Safety {
+                severity: max_severity,
+                flags: union_flags,
+                evidence_hash,
+                attested_at: latest_timestamp,
+            })
+        }
+    }
+
+    /// Evaluates whether an asset passes a severity ceiling under consumer-chosen quorum with conservative aggregation.
+    ///
+    /// Conservative aggregation rule: requires at least `threshold` responding attestors within `max_age_secs`.
+    /// The aggregate result takes the **highest severity** and **union of flags** among all responding attestors.
+    /// Returns `true` only if quorum is reached, aggregate severity <= `max_severity`, and the confiscation invariant holds
+    /// (or max_severity >= SEVERITY_HIGH).
+    pub fn is_safe_quorum(
+        env: Env,
+        asset: Address,
+        attestors: Vec<Address>,
+        threshold: u32,
+        max_severity: u32,
+        max_age_secs: u64,
+    ) -> bool {
+        // Deduplicate attestors
+        let mut deduped = Vec::new(&env);
+        for a in attestors.iter() {
+            let mut found = false;
+            for d in deduped.iter() {
+                if a == d {
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                deduped.push_back(a);
+            }
+        }
+
+        let deduped_len = deduped.len();
+        if threshold == 0 || threshold > deduped_len || deduped_len > MAX_ATTESTORS {
+            return false;
+        }
+
+        let now = env.ledger().timestamp();
+        let mut responding_count = 0u32;
+        let mut agg_severity = 0u32;
+        let mut agg_flags = 0u32;
+
+        for attestor in deduped.iter() {
+            if let Some(s) = Self::get_attestation(env.clone(), attestor, asset.clone()) {
+                if max_age_secs == 0 || now.saturating_sub(s.attested_at) <= max_age_secs {
+                    responding_count += 1;
+                    if s.severity > agg_severity {
+                        agg_severity = s.severity;
+                    }
+                    agg_flags |= s.flags;
+                }
+            }
+        }
+
+        if responding_count < threshold {
+            return false;
+        }
+
+        if agg_severity > max_severity {
+            return false;
+        }
+
+        if agg_flags & CONFISCATION_MASK != 0 && max_severity < SEVERITY_HIGH {
+            return false;
         }
 
         true

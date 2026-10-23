@@ -44,6 +44,12 @@ func NewCanonicalTime(t time.Time) CanonicalTime {
 // Time returns the underlying instant.
 func (c CanonicalTime) Time() time.Time { return time.Time(c) }
 
+// Equal reports whether c and t represent the same instant.
+func (c CanonicalTime) Equal(t time.Time) bool { return c.Time().Equal(t) }
+
+// Format renders the underlying time with the requested layout.
+func (c CanonicalTime) Format(layout string) string { return c.Time().Format(layout) }
+
 // IsZero reports whether the instant is the zero time, mirroring
 // time.Time.IsZero for callers that treat a missing stamp as unknown.
 func (c CanonicalTime) IsZero() bool { return c.Time().IsZero() }
@@ -106,8 +112,17 @@ type Evidence struct {
 	// reproducing. A future encoding may bind it; that would be a version bump.
 	RequestedURL string `json:"requested_url,omitempty"`
 	Claim        string `json:"claim"`
-	// RetrievedAt marshals through the canonical whole-second UTC wire format
-	// (issue #52), not time.Time's default RFC3339Nano.
+	// RetrievedAt is when this specific fact was observed from the source (or
+	// when the attempt was made, if the fetch failed).
+	//
+	// Clock source: scanner host wall clock (time.Now().UTC()).
+	// Precision: nanoseconds in memory (time.Time); on the wire it marshals
+	// through the canonical whole-second UTC format (issue #52), not
+	// time.Time's default RFC3339Nano.
+	//
+	// When a fetch fails, RetrievedAt carries the attempt time, Attempted is
+	// true, and Claim reads "not retrievable: <reason>". An absent retrieval
+	// time is never represented as a zero timestamp. See docs/timestamps.md.
 	RetrievedAt CanonicalTime `json:"retrieved_at"`
 	// Attempted marks evidence whose RetrievedAt is the time the fetch was
 	// ATTEMPTED, not the time the source answered: the fetch failed, so there
@@ -164,7 +179,12 @@ type Finding struct {
 	MechanicNames []string `json:"mechanics"`
 	// Accountability is set only by the check that establishes it.
 	Accountability *Accountability `json:"accountability,omitempty"`
-	Evidence       []Evidence      `json:"evidence"`
+	// AccountabilityReason classifies why the accountability verdict was
+	// reached, so consumers can distinguish "could not fetch" from "fetched
+	// but not claimed" from JSON alone. Absent when the check did not
+	// classify the verdict (for example a verified claim).
+	AccountabilityReason *AccountabilityReason `json:"accountability_reason,omitempty"`
+	Evidence             []Evidence            `json:"evidence"`
 }
 
 // Subject is the pre-fetched state a check reasons over. Checks must not reach
@@ -398,6 +418,10 @@ type Report struct {
 
 	// Accountability is reported alongside severity, never folded into it.
 	Accountability Accountability `json:"accountability"`
+	// AccountabilityReason classifies why the accountability verdict was
+	// reached. It is report metadata, not part of the hashed evidence
+	// preimage; see docs/contract-interface.md for the encoding decision.
+	AccountabilityReason *AccountabilityReason `json:"accountability_reason,omitempty"`
 
 	// State is the overall verdict state of the report:
 	//   - "valid": a fresh, complete verdict.
@@ -457,13 +481,14 @@ type Report struct {
 	// check-set binding carry no CheckSet and are read as "unknown", never as
 	// "complete".
 	CheckSet []string `json:"checks,omitempty"`
+	// Checks is retained for the legacy evidence preimage encoding.
+	Checks []string `json:"-"`
 
-	// ScannerBound opts this report into the v3 preimage encoding, which
+	// ScannerBound opts this report into the v4 preimage encoding, which
 	// adds a `scanner` line naming the code that produced the report
-	// (issue #40). It is a deliberate opt-in flag rather than automatic so
-	// the encoding stays a property of the report: v1/v2 bytes are unchanged
-	// for every report that does not set it, which is what keeps the ten
-	// attestations already on chain reproducible. The identity itself is
+	// (issue #40). scan.Scanner sets it on every report it produces (#271);
+	// Engine.Run does not, so fixture-driven reports keep whatever encoding
+	// their other bindings select. The identity itself is
 	// attest.ScannerIdentity (the module version); the flag only decides
 	// whether the hashed bytes name it. Serialized so a report document can
 	// carry the fact that it was produced under identity binding.
@@ -595,6 +620,9 @@ func (e *Engine) Run(ctx context.Context, s *Subject) (*Report, error) {
 
 		if f.Accountability != nil {
 			rep.Accountability = *f.Accountability
+		}
+		if f.AccountabilityReason != nil {
+			rep.AccountabilityReason = f.AccountabilityReason
 		}
 		// The escalation invariant, enforced here rather than left as
 		// convention: a finding marked Escalation may raise the level and set
