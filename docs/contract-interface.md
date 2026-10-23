@@ -628,7 +628,7 @@ tag names exactly one layout**: the tag alone says which lines follow and in
 what order.
 
 ```
-assay-evidence-v1
+assay-evidence-v2
 asset	CODE-ISSUER
 severity	N
 base_severity	N
@@ -831,7 +831,19 @@ cost is that the hash cannot distinguish a fresh confirmation from a stale one
   reimplementer must refuse it the same way.
 
 The version line is inside the hash, so a future encoding change cannot produce
-bytes a verifier would silently compare against v1.
+bytes a verifier would silently compare against v2. Historical v1 attestations
+must continue to use the v1 rules and cannot be silently interpreted as v2.
+
+### Canonicalization of fetch failures
+
+Transport failures from `stellar.toml` are canonicalized before hashing. The
+allowed values are a closed set: `dns-failure`, `connection-refused`,
+`tls-failure`, `timeout`, `status N`, and `unknown-failure`. The URL field for a
+failed fetch is the fixed value `stellar.toml`. Hostnames, resolver addresses,
+IP addresses, ports, retry counts, timing values, and raw library error text are
+environmental transport variables, so including them would make identical
+evidence hash differently across machines. The raw error is still retained in
+the human diagnostics and reasoning response.
 
 #### The preimage binds the check set
 
