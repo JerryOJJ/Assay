@@ -21,9 +21,7 @@ STELLAR_CLI_VERSION := 27.1.0
 
 .PHONY: help doctor all build build-release test test-notify test-preimage test-reproducibility test-stellar-cli-version cover lint fmt vet run clean \
 	offline-test e2e-standalone \
-	contract-test contract-lint contract-build \
-	build-contract deploy-testnet attest read check-stellar-cli-version verify-gate verify-wasm \
-	eval-record eval-compare
+	contract-test contract-lint contract-build wasm-size \n	build-contract deploy-testnet attest read check-stellar-cli-version verify-gate verify-wasm \n	eval-record eval-compare
 
 help: ## List every target with a one-line description
 	@awk 'BEGIN {FS = ":.*## "; print "Usage: make <target>\n\nTargets:"} /^[a-zA-Z0-9_.-]+:.*## / {printf "  %-20s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -135,6 +133,9 @@ contract-lint: ## Check contract formatting and run clippy with warnings denied
 
 contract-build: ## Compile the contracts to wasm without the stellar optimizer
 	cd $(CONTRACTS) && cargo build --release --target wasm32v1-none
+
+wasm-size: ## Check the contract wasm sizes against assay-contracts/wasm-size-baseline.json
+	./scripts/check-wasm-size.sh
 
 # Fail before invoking a CLI version that may produce incompatible output or wasm.
 check-stellar-cli-version:
