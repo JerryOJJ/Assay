@@ -3,6 +3,7 @@ package mechanics
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/use-assay/assay/internal/sep1"
 )
@@ -42,8 +43,16 @@ func (c DomainCheck) Run(_ context.Context, s *Subject) (Finding, error) {
 	acc := AccountabilityUnknown
 	f.Accountability = &acc
 
+	// A document that names the wrong network is reported before anything else
+	// it might say, because the contradiction is not about this asset: it is
+	// about the document itself. Reported whenever a document was read, on
+	// every path below, so no later early return can drop it.
+	appendNetworkPassphraseEvidence(&f, s)
+
 	domain := s.HomeDomain()
 	if domain == "" {
+		reason := AccountabilityReasonNoHomeDomain
+		f.AccountabilityReason = &reason
 		f.Mechanics = MechDomainUnverified
 		f.Reasoning = "The issuer account advertises no home_domain, so there is no " +
 			"published identity to verify against. Nobody has publicly claimed this " +
@@ -60,6 +69,8 @@ func (c DomainCheck) Run(_ context.Context, s *Subject) (Finding, error) {
 		f.Mechanics = MechDomainUnverified
 		acc = AccountabilityUnverified
 		f.Accountability = &acc
+		reason := AccountabilityReasonMismatch
+		f.AccountabilityReason = &reason
 		f.Reasoning = fmt.Sprintf(
 			"The issuer advertises home_domain %q, but the curated directory lists the "+
 				"same issuer under %q. The two sources disagree about who claims this "+
@@ -84,6 +95,8 @@ func (c DomainCheck) Run(_ context.Context, s *Subject) (Finding, error) {
 	if s.Toml == nil {
 		acc = AccountabilityUnverified
 		f.Mechanics = MechDomainUnverified
+		reason := AccountabilityReasonFetchFailed
+		f.AccountabilityReason = &reason
 		if s.TomlRefused {
 			// A host-policy refusal is a decision Assay made, not a source that
 			// failed. It is reported as attributed evidence, the same way a
@@ -144,6 +157,15 @@ func (c DomainCheck) Run(_ context.Context, s *Subject) (Finding, error) {
 			return c.resolveLinked(f, s, domain, res), nil
 		}
 
+		// SEP-0001 lets a currency entry delegate to its own TOML file. When
+		// those links were followed, a match there is a claim like any other;
+		// when they could not all be read, the answer stays unresolved and must
+		// not be reported as a refusal. Overstating a negative is the same
+		// class of error as overstating a positive.
+		if res := s.TomlLinked; res != nil {
+			return c.resolveLinked(f, s, domain, res), nil
+		}
+
 		// SEP-0001 lets a currency entry delegate to its own TOML file, and
 		// does not require the link to be the entry's only field: an entry may
 		// carry a code and issuer next to the link. Assay does not follow those
@@ -154,6 +176,8 @@ func (c DomainCheck) Run(_ context.Context, s *Subject) (Finding, error) {
 		// Overstating a negative is the same class of error as overstating a
 		// positive.
 		if linked := s.Toml.LinkedCurrencies(s.Asset.Code, s.Asset.Issuer); linked > 0 {
+			reason := AccountabilityReasonNotClaimed
+			f.AccountabilityReason = &reason
 			f.Reasoning = fmt.Sprintf(
 				"The issuer advertises home_domain %q and that domain publishes a "+
 					"stellar.toml, but this asset (%s) is not declared inline in its "+
@@ -181,6 +205,8 @@ func (c DomainCheck) Run(_ context.Context, s *Subject) (Finding, error) {
 
 		acc = AccountabilityUnverified
 		f.Mechanics = MechDomainUnverified
+		reason := AccountabilityReasonNotClaimed
+		f.AccountabilityReason = &reason
 		f.Reasoning = fmt.Sprintf(
 			"The issuer advertises home_domain %q and that domain publishes a "+
 				"stellar.toml, but the toml does not list this asset (%s) in its "+
@@ -211,7 +237,112 @@ func (c DomainCheck) Run(_ context.Context, s *Subject) (Finding, error) {
 		Claim:       "CURRENCIES claims " + s.Asset.String(),
 		RetrievedAt: NewCanonicalTime(s.Toml.FetchedAt),
 	})
+	// SEP-0001 lets a CURRENCIES entry carry a status — "live", "dead",
+	// "test". An issuer declaring its own asset dead or test is a fact a
+	// prospective holder wants, the document is already fetched, and
+	// surfacing it costs nothing. It is relayed as attributed evidence and
+	// moves nothing else: it is the issuer's own claim about its own asset,
+	// not a ledger fact, so severity stays capability-only — and an issuer
+	// can write any string here, so Assay never treats it as a determination
+	// of its own. Accountability was already settled by the reciprocity test
+	// above and is unchanged by what the claim says.
+	if status := s.Toml.Status(s.Asset.Code, s.Asset.Issuer); status != "" {
+		f.Evidence = append(f.Evidence, Evidence{
+			Source:      "stellar.toml",
+			URL:         s.Toml.URL,
+			Claim:       "CURRENCIES entry status: " + status,
+			RetrievedAt: NewCanonicalTime(s.Toml.FetchedAt),
+		})
+	}
+	// The document also declares who publishes it (ORG_NAME / ORG_URL), which
+	// is what a human reading the report wants first: who claims to be behind
+	// this asset. Relayed as attributed evidence and nothing else — see
+	// appendOrganisationEvidence for why it moves no other field.
+	appendOrganisationEvidence(&f, s.Toml)
 	return f, nil
+}
+
+// appendNetworkPassphraseEvidence adds the toml's own NETWORK_PASSPHRASE
+// declaration to the finding when it contradicts the network the scan read
+// from (#370).
+//
+// Network binding (#41) already refuses a scan whose declared network and
+// Horizon endpoint disagree, because the same CODE-ISSUER can exist on two
+// networks with different flags. This is the same question put to the third
+// party in the chain: the document is written for exactly one network, so a
+// toml that declares the testnet passphrase while the scan reads pubnet is
+// either stale, published for another network, or impersonating an issuer —
+// worth surfacing in every case, and attributable to the document in the same
+// way every other issuer claim is: source, URL and retrieval time, quoted so
+// both sides of the contradiction are readable in the report.
+//
+// It moves nothing else. Severity stays capability-only — an issuer cannot buy
+// or lose a level through a passphrase — and accountability was settled by the
+// reciprocity test, not by this field. Absence is not a mismatch: the key is
+// optional, so a document that declares it has made a claim and only a claimed
+// value can be contradicted, and a scan that never declared a network has
+// nothing to compare against. Either way no evidence is added, so the evidence
+// bytes — and therefore evidence_hash — are unchanged for every report without
+// a declared contradiction.
+func appendNetworkPassphraseEvidence(f *Finding, s *Subject) {
+	doc := s.Toml
+	if doc == nil || doc.NetworkPassphrase == "" || s.Network == "" {
+		return
+	}
+	if doc.NetworkPassphrase == string(s.Network) {
+		return
+	}
+	f.Evidence = append(f.Evidence, Evidence{
+		Source: "stellar.toml",
+		URL:    doc.URL,
+		Claim: fmt.Sprintf("NETWORK_PASSPHRASE %q does not match the scanned network %q",
+			doc.NetworkPassphrase, s.Network),
+		RetrievedAt: NewCanonicalTime(doc.FetchedAt),
+	})
+}
+
+// appendOrganisationEvidence adds the toml's own publisher fields — ORG_NAME
+// and ORG_URL — to the finding as one attributed evidence claim, when the
+// document publishes at least one of them.
+//
+// A reader of a report wants to know who claims to be behind an asset, and the
+// claim is the toml's, not Assay's: the fields are relayed with the source and
+// the URL they were read from, quoted with %q exactly like every other
+// issuer-controlled string in this report (home_domain, a directory name), so
+// the encoder escapes them into their own field like every other claim before
+// they reach the hashed preimage.
+//
+// It moves nothing else. Severity stays capability-only — an issuer buying
+// attribution gains nothing there — and accountability was already settled by
+// the reciprocity test, not by who the document says it is: a toml may name
+// anyone it likes, so this is never a verification of identity, only a relay
+// of the claim. A document that declares neither field contributes no evidence
+// at all, so the evidence bytes — and therefore evidence_hash — are unchanged
+// for every asset attested without one.
+//
+// doc is the document the fields were read from, and its URL is what the claim
+// is attributed to: for a linked claim that is still the document home_domain
+// itself, not the per-currency file the asset claim came from.
+func appendOrganisationEvidence(f *Finding, doc *sep1.Doc) {
+	if doc == nil {
+		return
+	}
+	claims := make([]string, 0, 2)
+	if doc.Documentation.OrgName != "" {
+		claims = append(claims, fmt.Sprintf("ORG_NAME %q", doc.Documentation.OrgName))
+	}
+	if doc.Documentation.OrgURL != "" {
+		claims = append(claims, fmt.Sprintf("ORG_URL %q", doc.Documentation.OrgURL))
+	}
+	if len(claims) == 0 {
+		return
+	}
+	f.Evidence = append(f.Evidence, Evidence{
+		Source:      "stellar.toml",
+		URL:         doc.URL,
+		Claim:       strings.Join(claims, " "),
+		RetrievedAt: NewCanonicalTime(doc.FetchedAt),
+	})
 }
 
 // resolveLinked renders the domain finding for an issuer whose asset was not
@@ -249,12 +380,19 @@ func (DomainCheck) resolveLinked(f Finding, s *Subject, domain string, res *sep1
 			Claim:       "linked document claims " + s.Asset.String(),
 			RetrievedAt: NewCanonicalTime(retrieved),
 		})
+		// A verified claim is a verified claim however it arrived, so the
+		// publisher declared by the document home_domain points at is surfaced
+		// here exactly as it is for an inline claim — attributed to the document
+		// that declared it, not to the linked file the claim came from.
+		appendOrganisationEvidence(&f, s.Toml)
 		return f
 	}
 
 	acc := AccountabilityUnverified
 	f.Accountability = &acc
 	f.Mechanics = MechDomainUnverified
+	reason := AccountabilityReasonNotClaimed
+	f.AccountabilityReason = &reason
 
 	// The bound was reached before every link could be read. The documents
 	// past the bound may have claimed the asset, so this is unresolved, not a
