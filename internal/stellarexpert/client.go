@@ -376,7 +376,9 @@ func (c *Client) BlockedDomain(ctx context.Context, domain string, opts ...Looku
 			return Answer[BlockedDomain]{}, err
 		}
 		at := c.now()
-		if !found {
+		// A record with no domain names nothing on the blocklist: treat it as
+		// not blocked rather than reporting an empty entry as a listing.
+		if !found || b.Domain == "" {
 			return Answer[BlockedDomain]{FetchedAt: at}, nil
 		}
 		return Answer[BlockedDomain]{Value: &b, FetchedAt: at}, nil
@@ -441,7 +443,7 @@ func (c *Client) get(ctx context.Context, target string, out any) (bool, error) 
 	for attempt := 0; attempt < opts.Attempts; attempt++ {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
 		if err != nil {
-			return false, err
+			return false, fmt.Errorf("stellarexpert: build request %s: %w", target, err)
 		}
 		req.Header.Set("Accept", "application/json")
 		req.Header.Set("User-Agent", c.UserAgent)
@@ -454,7 +456,7 @@ func (c *Client) get(ctx context.Context, target string, out any) (bool, error) 
 			}
 			t := opts.Backoff(attempt, 0)
 			if !wait(ctx, t) {
-				return false, ctx.Err()
+				return false, fmt.Errorf("stellarexpert: get %s: %w", target, ctx.Err())
 			}
 			continue
 		}
@@ -471,7 +473,7 @@ func (c *Client) get(ctx context.Context, target string, out any) (bool, error) 
 			}
 			t := opts.Backoff(attempt, retryAfter)
 			if !wait(ctx, t) {
-				return false, ctx.Err()
+				return false, fmt.Errorf("stellarexpert: get %s: %w", target, ctx.Err())
 			}
 			continue
 		}
@@ -482,7 +484,7 @@ func (c *Client) get(ctx context.Context, target string, out any) (bool, error) 
 			}
 			t := opts.Backoff(attempt, 0)
 			if !wait(ctx, t) {
-				return false, ctx.Err()
+				return false, fmt.Errorf("stellarexpert: get %s: %w", target, ctx.Err())
 			}
 			continue
 		}
@@ -495,7 +497,7 @@ func (c *Client) get(ctx context.Context, target string, out any) (bool, error) 
 			}
 			t := opts.Backoff(attempt, 0)
 			if !wait(ctx, t) {
-				return false, ctx.Err()
+				return false, fmt.Errorf("stellarexpert: read %s: %w", target, ctx.Err())
 			}
 			continue
 		}
@@ -506,7 +508,7 @@ func (c *Client) get(ctx context.Context, target string, out any) (bool, error) 
 			}
 			t := opts.Backoff(attempt, 0)
 			if !wait(ctx, t) {
-				return false, ctx.Err()
+				return false, fmt.Errorf("stellarexpert: decode %s: %w", target, ctx.Err())
 			}
 			continue
 		}

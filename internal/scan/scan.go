@@ -40,6 +40,18 @@ var codeRE = regexp.MustCompile(`^[A-Za-z0-9]{1,12}$`)
 // ErrBadAsset reports an unparseable asset identifier.
 var ErrBadAsset = errors.New("scan: invalid asset")
 
+// ErrNativeAsset reports an input that names the network's native asset
+// ("native" or "XLM").
+//
+// The native asset has no issuer account, so there are no authorization flags
+// to read and nothing for the engine to classify: it is not a scannable asset,
+// and it is never attested. It gets its own error rather than ErrBadAsset
+// because the input is understood, not malformed — the answer is a fact about
+// the ledger, so it says so instead of complaining about the input's shape.
+// It is returned before any fetch, so it can never produce a report.
+// Documented in docs/cli.md (exit code) and docs/api.md (HTTP status).
+var ErrNativeAsset = errors.New("native asset has no issuer and no authorization flags")
+
 // ErrBadHolder reports an invalid holder account ID.
 var ErrBadHolder = errors.New("scan: invalid holder account ID")
 
@@ -52,11 +64,42 @@ func ValidateHolder(id string) error {
 	return nil
 }
 
-// ParseAsset accepts the canonical CODE-ISSUER form and validates both halves.
+// ParseAsset accepts the canonical CODE-ISSUER form, the colon-separated
+// CODE:ISSUER form most Stellar tools print, and a paste-able stellar.expert
+// asset URL, and validates both halves of the identifier.
+//
+// Whichever spelling arrived, it is normalised to CODE-ISSUER before the halves
+// are validated, and the returned mechanics.Asset renders only as CODE-ISSUER
+// (mechanics.Asset.String). Every output downstream — the report, the evidence
+// lines, the attestation preimage — is built from that struct, never from the
+// user's raw argument, so the bytes hashed for "USDC:G…" and for the same
+// asset pasted as a stellar.expert URL are identical to the canonical input's.
+// The input's spelling never reaches the preimage.
+//
+// The one input with no CODE-ISSUER that is not an error of shape is the
+// native asset: "native" and "XLM" (any case) are recognised and refused with
+// ErrNativeAsset's explanation — no issuer, no authorization flags, nothing to
+// scan, nothing to attest. Every other separator-less input is ErrBadAsset.
 func ParseAsset(s string) (mechanics.Asset, error) {
 	s = strings.TrimSpace(s)
+	if looksLikeURL(s) {
+		canon := assetFromExplorerURL(s)
+		if canon == "" {
+			return mechanics.Asset{}, fmt.Errorf("%w: %q is not a stellar.expert asset URL (want …/asset/CODE-ISSUER)",
+				ErrBadAsset, s)
+		}
+		s = canon
+	}
+	// The colon-separated spelling: tools and docs print CODE:ISSUER, so a
+	// strict hyphen-only parser would turn a correct asset into a usage error.
+	// A URL scheme was consumed above, so the first remaining colon is the
+	// separator. Only the first: an issuer key never carries another.
+	s = strings.Replace(s, ":", "-", 1)
 	code, issuer, ok := strings.Cut(s, "-")
 	if !ok {
+		if isNativeName(s) {
+			return mechanics.Asset{}, fmt.Errorf("%w: %q cannot be scanned or attested", ErrNativeAsset, s)
+		}
 		return mechanics.Asset{}, fmt.Errorf("%w: expected CODE-ISSUER, got %q", ErrBadAsset, s)
 	}
 	// Trailing "-1"/"-2" suffixes appear in some explorer asset identifiers.
@@ -72,6 +115,79 @@ func ParseAsset(s string) (mechanics.Asset, error) {
 	return mechanics.Asset{Code: code, Issuer: issuer}, nil
 }
 
+// isNativeName reports whether s names the ledger's native asset in one of the
+// forms people actually type: "native" or the ticker "XLM", in any case.
+//
+// It is only consulted for inputs with no issuer half, so a credit asset whose
+// code merely happens to be XLM ("XLM-G…") still parses as an ordinary asset.
+func isNativeName(s string) bool {
+	switch strings.ToLower(s) {
+	case "native", "xlm":
+		return true
+	default:
+		return false
+	}
+}
+
+// looksLikeURL reports whether s was pasted as a URL rather than typed as a
+// bare asset identifier: it carries a scheme, or it starts at the host people
+// paste from without one ("stellar.expert/…" survives a terminal that strips
+// the scheme).
+//
+// A URL spelling is routed to assetFromExplorerURL instead of being cut on a
+// hyphen: any other URL is refused with an explanation of the shape that was
+// wanted rather than misparsed into a plausible-looking asset.
+func looksLikeURL(s string) bool {
+	lower := strings.ToLower(s)
+	if strings.Contains(lower, "://") {
+		return true
+	}
+	return strings.HasPrefix(lower, "stellar.expert/") ||
+		strings.HasPrefix(lower, "www.stellar.expert/")
+}
+
+// assetFromExplorerURL returns the CODE-ISSUER segment of a stellar.expert
+// asset URL — https://stellar.expert/explorer/<network>/asset/CODE-ISSUER — or
+// "" when u is not such a URL.
+//
+// The <network> segment is deliberately not inspected: it says where the
+// explorer was browsing, not which ledger the scan reads. Network binding is
+// the scanner's job (#41) — resolveNetwork cross-checks Horizon against the
+// declared network — so accepting a testnet-namespace URL here cannot make a
+// pubnet scan attest a testnet fact; it only names the asset.
+//
+// Query strings and fragments are dropped, the host is matched
+// case-insensitively, and a trailing sequence suffix ("-1") on the identifier
+// is left for the caller's existing suffix handling.
+func assetFromExplorerURL(u string) string {
+	if i := strings.Index(u, "://"); i >= 0 {
+		u = u[i+3:]
+	}
+	if i := strings.IndexAny(u, "?#"); i >= 0 {
+		u = u[:i]
+	}
+	host, path, ok := strings.Cut(u, "/")
+	if !ok {
+		return ""
+	}
+	switch strings.ToLower(host) {
+	case "stellar.expert", "www.stellar.expert":
+	default:
+		return ""
+	}
+	const marker = "/asset/"
+	i := strings.Index(path, marker)
+	if i < 0 {
+		return ""
+	}
+	rest := path[i+len(marker):]
+	seg := rest
+	if j := strings.Index(rest, "/"); j >= 0 {
+		seg = rest[:j]
+	}
+	return seg
+}
+
 // Scanner fetches subject state and classifies it.
 type Scanner struct {
 	Horizon *horizon.Client
@@ -83,6 +199,21 @@ type Scanner struct {
 
 	// FetchTimeout bounds any single source fetch. Zero means DefaultFetchTimeout.
 	FetchTimeout time.Duration
+
+	// Now, when non-nil, replaces the scanner's own wall clock. Every
+	// timestamp the scanner stamps is read from it — the scan start, the
+	// ledger fetch completions, and each best-effort source's attempt time —
+	// so a test can pin that whole set and compare a rendered response
+	// against a committed golden file (see docs/api-versioning.md, "The
+	// golden scan response").
+	//
+	// Sources that stamp their own answers keep their own clocks: the
+	// StellarExpert client stamps curated answers with stellarexpert.Options.Now,
+	// and the sep1 fetcher stamps a resolved stellar.toml with time.Now. A
+	// golden render pins those directly on the client, the same way this
+	// field pins the scanner's. nil means time.Now().UTC(), which is what
+	// production leaves it as.
+	Now func() time.Time
 
 	// Network is the Stellar network the scan claims to read, named by the
 	// full network passphrase. It is stamped onto every Subject and bound
@@ -219,6 +350,18 @@ func (s *Scanner) fetchTimeout() time.Duration {
 	return DefaultFetchTimeout
 }
 
+// now is the scanner's clock: the pinned one when a test installs Scanner.Now,
+// the host wall clock otherwise. Every timestamp the scanner itself records
+// during subject assembly goes through it, so one override fixes the whole
+// set — the only other time sources a golden render sees are the ones a source
+// client stamps on its own answers, which the golden test pins on the client.
+func (s *Scanner) now() time.Time {
+	if s.Now != nil {
+		return s.Now()
+	}
+	return time.Now().UTC()
+}
+
 // Subject fetches everything the checks need for one asset.
 //
 // Only the ledger lookups are fatal: without issuer flags there is no
@@ -231,30 +374,30 @@ func (s *Scanner) Subject(ctx context.Context, a mechanics.Asset) (*mechanics.Su
 	if err != nil {
 		return nil, err
 	}
-	sub := &mechanics.Subject{Asset: a, ScannedAt: time.Now().UTC(), Network: network}
+	sub := &mechanics.Subject{Asset: a, ScannedAt: s.now(), Network: network}
 	timeout := s.fetchTimeout()
 
 	statCtx, cancelStat := context.WithTimeout(ctx, timeout)
 	stat, err := s.Horizon.Asset(statCtx, a.Code, a.Issuer)
 	cancelStat()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("scan: fetch asset record: %w", err)
 	}
 	sub.Stat = stat
 	// Each fetch stamps its own completion time. Later temporal statements —
 	// how stale one source's answer was relative to another's — are only
 	// honest if the times were recorded per source, not reused from the scan
 	// start.
-	sub.StatFetchedAt = time.Now().UTC()
+	sub.StatFetchedAt = s.now()
 
 	acctCtx, cancelAcct := context.WithTimeout(ctx, timeout)
 	issuer, err := s.Horizon.Account(acctCtx, a.Issuer)
 	cancelAcct()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("scan: fetch issuer account: %w", err)
 	}
 	sub.Issuer = issuer
-	sub.IssuerFetchedAt = time.Now().UTC()
+	sub.IssuerFetchedAt = s.now()
 
 	var (
 		wg sync.WaitGroup
@@ -291,17 +434,25 @@ func (s *Scanner) Subject(ctx context.Context, a mechanics.Asset) (*mechanics.Su
 		dirURL       string
 	)
 
-	if domain := issuer.HomeDomain; domain != "" {
+	// Canonicalise the issuer's free-text home_domain once, here, so that
+	// every consumer of the string agrees on which domain is being named:
+	// the requested stellar.toml URL, the redirect policy (pinned to the
+	// requested host), and the blocklist lookup below. A blocklist is keyed
+	// by exact string, so "EXAMPLE.com" or "example.com." from the ledger
+	// must not silently miss an entry listed under "example.com" — that is
+	// a false negative on the one signal that can escalate severity.
+	domain := sep1.NormalizeDomain(issuer.HomeDomain)
+	if domain != "" {
 		tomlURL = sep1.URLFor(domain)
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			tomlCtx, cancel := context.WithTimeout(ctx, timeout)
 			defer cancel()
-			attempted := time.Now().UTC()
+			attempted := s.now()
 			doc, err := s.Toml.Fetch(tomlCtx, domain)
 			if err != nil {
-				tomlErr = err.Error()
+				tomlErr = sep1.CanonicalFailure(err)
 				// A host-policy refusal is a decision, not an outage. It is
 				// recorded as such so the domain check can report a refusal
 				// rather than a source that failed to answer.
@@ -321,11 +472,11 @@ func (s *Scanner) Subject(ctx context.Context, a mechanics.Asset) (*mechanics.Su
 			defer wg.Done()
 			blockedCtx, cancel := context.WithTimeout(ctx, timeout)
 			defer cancel()
-			attempted := time.Now().UTC()
+			attempted := s.now()
 			blocked, err := s.Expert.BlockedDomain(blockedCtx, domain)
 			blockedAttAt = attempted
 			if err != nil {
-				blockedErr = err.Error()
+				blockedErr = sep1.CanonicalFailure(err)
 			} else {
 				blockedVal = blocked
 				// The source's OWN completion time, which on a cache hit is
@@ -345,11 +496,11 @@ func (s *Scanner) Subject(ctx context.Context, a mechanics.Asset) (*mechanics.Su
 		defer wg.Done()
 		dirCtx, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
-		attempted := time.Now().UTC()
+		attempted := s.now()
 		entry, err := s.Expert.Directory(dirCtx, a.Issuer)
 		dirAttAt = attempted
 		if err != nil {
-			dirErr = err.Error()
+			dirErr = sep1.CanonicalFailure(err)
 		} else {
 			dirVal = entry
 			// As above: the directory answer's own fetch time, not this scan's.
@@ -402,7 +553,7 @@ func (s *Scanner) Subject(ctx context.Context, a mechanics.Asset) (*mechanics.Su
 		sub.TomlLinked = s.Toml.ResolveLinked(ctx, tomlDoc, a.Code, a.Issuer)
 	}
 
-	if issuer.HomeDomain != "" {
+	if domain != "" {
 		sub.BlockedURL = blockedURL
 		sub.Blocked = blockedVal.Value
 		sub.BlockedErr = blockedErr
@@ -436,13 +587,13 @@ func (s *Scanner) Subject(ctx context.Context, a mechanics.Asset) (*mechanics.Su
 			lists = assetlist.New()
 		}
 		for _, listURL := range s.AssetListURLs {
-			attempted := time.Now().UTC()
+			attempted := s.now()
 			list, err := lists.Fetch(ctx, listURL)
 			if err != nil {
 				sub.AssetLists = append(sub.AssetLists, mechanics.AssetListSignal{
 					URL:         listURL,
 					AttemptedAt: attempted,
-					Err:         err.Error(),
+					Err:         sep1.CanonicalFailure(err),
 				})
 				continue
 			}
@@ -471,11 +622,44 @@ func (s *Scanner) Subject(ctx context.Context, a mechanics.Asset) (*mechanics.Su
 
 // Scan fetches and classifies an asset.
 func (s *Scanner) Scan(ctx context.Context, a mechanics.Asset) (*mechanics.Report, error) {
+	rep, _, err := s.ScanWithSubject(ctx, a)
+	return rep, err
+}
+
+// ScanWithSubject fetches and classifies an asset, returning both the report
+// and the Subject it was built from.
+//
+// The Subject is the scanner's own primary reading — the two Horizon flag
+// copies the differential check compares against a second ledger route. A
+// caller that only needs the report should use Scan; this exists so a
+// verification that also performs the differential read does not fetch the
+// asset twice and cannot compare the independent reading against a different
+// snapshot than the one the report describes.
+func (s *Scanner) ScanWithSubject(ctx context.Context, a mechanics.Asset) (*mechanics.Report, *mechanics.Subject, error) {
 	sub, err := s.Subject(ctx, a)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return s.Engine.Run(ctx, sub)
+	rep, err := bindScanner(s.Engine.Run(ctx, sub))
+	return rep, sub, err
+}
+
+// bindScanner marks a report produced by a real scan as scanner-bound, so its
+// evidence preimage names the code that produced it (the v4 encoding, #40 and
+// #271).
+//
+// The binding is switched on here rather than in Engine.Run or
+// attest.FromReport. Engine.Run classifies whatever Subject it is handed, and
+// unit tests and the eval harness drive it with fixtures; FromReport derives
+// arguments from a report it did not produce and must not add claims to it.
+// scan.Scanner is the entry point that performs a live scan, and it already
+// binds the network for the same reason, so every report it returns carries
+// all three bindings and is written under the newest encoding.
+func bindScanner(rep *mechanics.Report, err error) (*mechanics.Report, error) {
+	if rep != nil {
+		rep.ScannerBound = true
+	}
+	return rep, err
 }
 
 // SubjectWithHolder fetches everything Subject does, then additionally fetches
@@ -497,13 +681,13 @@ func (s *Scanner) SubjectWithHolder(ctx context.Context, a mechanics.Asset, hold
 		// Holder does not hold the asset; HolderTrustline stays nil with no
 		// error. The source did answer — "not listed" — so this records a
 		// completion time, not an attempt time.
-		sub.HolderFetchedAt = time.Now().UTC()
+		sub.HolderFetchedAt = s.now()
 	} else if err != nil {
-		sub.HolderTrustlineErr = err.Error()
-		sub.HolderAttemptedAt = time.Now().UTC()
+		sub.HolderTrustlineErr = sep1.CanonicalFailure(err)
+		sub.HolderAttemptedAt = s.now()
 	} else {
 		sub.HolderTrustline = tl
-		sub.HolderFetchedAt = time.Now().UTC()
+		sub.HolderFetchedAt = s.now()
 	}
 	return sub, nil
 }
@@ -521,5 +705,5 @@ func (s *Scanner) ScanWithHolder(ctx context.Context, a mechanics.Asset, holder 
 		eng = &mechanics.Engine{Checks: append([]mechanics.Check{}, s.Engine.Checks...)}
 		eng.Checks = append(eng.Checks, mechanics.TrustlineCheck{})
 	}
-	return eng.Run(ctx, sub)
+	return bindScanner(eng.Run(ctx, sub))
 }
