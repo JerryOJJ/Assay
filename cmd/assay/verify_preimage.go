@@ -48,7 +48,9 @@ func runVerifyPreimage(args []string) error {
 	if err != nil {
 		return &commandExitError{code: 3, err: err}
 	}
-	fmt.Fprintln(os.Stdout, outcome)
+	if _, err := fmt.Fprintln(os.Stdout, outcome); err != nil {
+		return &commandExitError{code: 3, err: fmt.Errorf("write verification outcome: %w", err)}
+	}
 	switch outcome {
 	case verifyMatch:
 		return nil
