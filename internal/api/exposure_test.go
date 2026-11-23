@@ -351,7 +351,11 @@ func TestExposureDeadlineReturnsPartialPage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GET exposure: %v", err)
 	}
-	defer resp.Body.Close()
+	t.Cleanup(func() {
+		if err := resp.Body.Close(); err != nil {
+			t.Errorf("close exposure response body: %v", err)
+		}
+	})
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		t.Fatalf("read partial response: %v", err)
